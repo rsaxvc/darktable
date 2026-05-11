@@ -168,23 +168,33 @@ static int decompress_jsc(dt_imageio_jpeg_t *jpg, uint8_t *out)
 
 static int decompress_plain(dt_imageio_jpeg_t *jpg, uint8_t *out)
 {
-  JSAMPROW row_pointer[1];
-  row_pointer[0] = (uint8_t *)dt_alloc_aligned((size_t)jpg->dinfo.output_width * jpg->dinfo.num_components);
+  // With subsampling, may have MCUs up to 16x16
+  #define MAX_LINES 16
+  JSAMPROW row_pointer[MAX_LINES];
+  row_pointer[0] = (uint8_t *)dt_alloc_aligned(((size_t)jpg->dinfo.output_width * jpg->dinfo.num_components + DT_CACHELINE_BYTES) * 16);
   if(!row_pointer[0])
     return 1;
+  for(unsigned i = 1; i < MAX_LINES; i++)
+    row_pointer[i] = row_pointer[0] + (((size_t)jpg->dinfo.output_width * jpg->dinfo.num_components * i + DT_CACHELINE_BYTES - 1) & ~(DT_CACHELINE_BYTES - 1));
   uint8_t *tmp = out;
   while(jpg->dinfo.output_scanline < jpg->dinfo.image_height)
   {
-    if(jpeg_read_scanlines(&(jpg->dinfo), row_pointer, 1) != 1)
+    JDIMENSION these_lines = jpg->dinfo.image_height - jpg->dinfo.output_scanline;
+    if(these_lines > MAX_LINES)
+      these_lines = MAX_LINES;
+    if(jpeg_read_scanlines(&(jpg->dinfo), row_pointer, these_lines) != these_lines)
     {
       dt_free_align(row_pointer[0]);
       return 1;
     }
-    for(unsigned int i = 0; i < jpg->dinfo.image_width; i++)
+    for(unsigned int y = 0; y < these_lines; y++)
     {
-      for(int k = 0; k < 3; k++) tmp[4 * i + k] = row_pointer[0][3 * i + k];
+      for(unsigned int i = 0; i < jpg->dinfo.image_width; i++)
+      {
+        for(int k = 0; k < 3; k++) tmp[4 * i + k] = row_pointer[0][3 * i + k];
+      }
+      tmp += 4 * jpg->width;
     }
-    tmp += 4 * jpg->width;
   }
   dt_free_align(row_pointer[0]);
   return 0;
