@@ -668,6 +668,12 @@ changes (where available).
   each image's own as-shot multipliers, and need to be pasted again
   that way.
 
+- JPEGs with 12 bits per sample, and lossless JPEGs with 9 to 16
+  bits, now load at their full precision and get thumbnails. 8-bit
+  JPEGs are decoded with 12 bits per sample, keeping precision that an
+  8-bit decode rounds away, for smoother gradients and shadows that
+  can be pushed further before they band.
+
 ## Bug Fixes
 
 - Fixed bands of slightly wrong colors in images demosaiced with AMaZE
@@ -1314,6 +1320,9 @@ changes (where available).
 
 - libwayland-client 1.20 and wayland-scanner, with GTK's Wayland
   backend, for wide gamut and HDR display on Wayland
+
+- libjpeg-turbo 3.0 to load 12-bit and lossless JPEGs, and 3.2 to
+  decode 8-bit JPEGs with 12 bits per sample
 
 ## Camera support, compared to 5.6
 
