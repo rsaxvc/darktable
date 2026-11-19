@@ -137,14 +137,19 @@ static void _set_out_color_space_hp(j_decompress_ptr dinfo)
 #define DT_JPEG_8_TO_12_WHITE (255.0f * 16.0f)
 
 // reads all scanlines of an image with 9 to 16 bits per sample, after
-// jpeg_start_decompress(), as RGBA into out, with white at 1.0
-static gboolean _read_scanlines_hp(j_decompress_ptr dinfo, float *out, const float white)
+// jpeg_start_decompress(), as RGBA into one of out_f, with white at 1.0, or
+// out_8, with white at 255
+static gboolean _read_scanlines_hp(j_decompress_ptr dinfo,
+                                   float *out_f,
+                                   uint8_t *out_8,
+                                   const float white)
 {
   const size_t width = dinfo->output_width;
   const int nc = dinfo->output_components;
   // gray is replicated into all three channels
   const int step = nc == 1 ? 0 : 1;
   const float scale = 1.0f / white;
+  const float scale_8 = 255.0f / white;
 
   // from libjpeg's image pool, which jpeg_destroy_decompress() frees, so an
   // error longjmp out of the decoder does not leak it
@@ -153,28 +158,45 @@ static gboolean _read_scanlines_hp(j_decompress_ptr dinfo, float *out, const flo
 
   while(dinfo->output_scanline < dinfo->output_height)
   {
-    float *o = out + 4 * width * dinfo->output_scanline;
+    const size_t offset = 4 * width * dinfo->output_scanline;
     const JDIMENSION lines = dinfo->data_precision <= 12
       ? jpeg12_read_scanlines(dinfo, (J12SAMPARRAY)&row, 1)
       : jpeg16_read_scanlines(dinfo, (J16SAMPARRAY)&row, 1);
     if(lines != 1)
       return FALSE;
 
-    for(size_t i = 0; i < width; i++)
+    if(out_f)
     {
-      for(int k = 0; k < 3; k++)
-        o[4 * i + k] = row[nc * i + step * k] * scale;
-      o[4 * i + 3] = 1.0f;
+      float *o = out_f + offset;
+      for(size_t i = 0; i < width; i++)
+      {
+        for(int k = 0; k < 3; k++)
+          o[4 * i + k] = row[nc * i + step * k] * scale;
+        o[4 * i + 3] = 1.0f;
+      }
+    }
+    else
+    {
+      uint8_t *o = out_8 + offset;
+      for(size_t i = 0; i < width; i++)
+      {
+        // samples can exceed white after a decode from 8 to 12 bits
+        for(int k = 0; k < 3; k++)
+          o[4 * i + k] = (uint8_t)fminf(row[nc * i + step * k] * scale_8 + 0.5f, 255.0f);
+        o[4 * i + 3] = 255;
+      }
     }
   }
   return TRUE;
 }
 
 // decodes an image with 9 to 16 bits per sample, after jpeg_read_header(),
-// into out and destroys the decompressor. from_8_bit says that the caller
-// raised data_precision of an 8-bit image to 12
+// into out_f or out_8 as _read_scanlines_hp() does, and destroys the
+// decompressor. from_8_bit says that the caller raised data_precision of an
+// 8-bit image to 12
 static dt_imageio_retval_t _decompress_hp(dt_imageio_jpeg_t *jpg,
-                                          float *out,
+                                          float *out_f,
+                                          uint8_t *out_8,
                                           const gboolean from_8_bit)
 {
   struct dt_imageio_jpeg_error_mgr jerr;
@@ -191,7 +213,7 @@ static dt_imageio_retval_t _decompress_hp(dt_imageio_jpeg_t *jpg,
 
   const float white = from_8_bit ? DT_JPEG_8_TO_12_WHITE
                                  : (float)((1 << jpg->dinfo.data_precision) - 1);
-  if(!_read_scanlines_hp(&(jpg->dinfo), out, white))
+  if(!_read_scanlines_hp(&(jpg->dinfo), out_f, out_8, white))
   {
     jpeg_destroy_decompress(&(jpg->dinfo));
     return DT_IMAGEIO_FILE_CORRUPTED;
@@ -283,6 +305,11 @@ static int decompress_plain(dt_imageio_jpeg_t *jpg, uint8_t *out)
 
 int dt_imageio_jpeg_decompress(dt_imageio_jpeg_t *jpg, uint8_t *out)
 {
+#ifdef DT_JPEG_HAVE_HIGH_PRECISION
+  if(jpg->dinfo.data_precision > 8)
+    return _decompress_hp(jpg, NULL, out, FALSE) != DT_IMAGEIO_OK;
+#endif
+
   struct dt_imageio_jpeg_error_mgr jerr;
   jpg->dinfo.err = jpeg_std_error(&jerr.pub);
   jerr.pub.error_exit = dt_imageio_jpeg_error_exit;
@@ -746,6 +773,15 @@ static int read_plain(dt_imageio_jpeg_t *jpg, uint8_t *out)
 
 int dt_imageio_jpeg_read(dt_imageio_jpeg_t *jpg, uint8_t *out)
 {
+#ifdef DT_JPEG_HAVE_HIGH_PRECISION
+  if(jpg->dinfo.data_precision > 8)
+  {
+    const int ret = _decompress_hp(jpg, NULL, out, FALSE) != DT_IMAGEIO_OK;
+    fclose(jpg->f);
+    return ret;
+  }
+#endif
+
   struct dt_imageio_jpeg_error_mgr jerr;
   jpg->dinfo.err = jpeg_std_error(&jerr.pub);
   jerr.pub.error_exit = dt_imageio_jpeg_error_exit;
@@ -863,7 +899,7 @@ static dt_imageio_retval_t _open_jpeg_hp(dt_image_t *img,
     return DT_IMAGEIO_CACHE_FULL;
   }
 
-  const dt_imageio_retval_t ret = _decompress_hp(jpg, buf, from_8_bit);
+  const dt_imageio_retval_t ret = _decompress_hp(jpg, buf, NULL, from_8_bit);
   fclose(jpg->f);
   return ret;
 }
