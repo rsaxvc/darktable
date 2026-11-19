@@ -169,6 +169,38 @@ static gboolean _read_scanlines_hp(j_decompress_ptr dinfo, float *out, const flo
   }
   return TRUE;
 }
+
+// decodes an image with 9 to 16 bits per sample, after jpeg_read_header(),
+// into out and destroys the decompressor. from_8_bit says that the caller
+// raised data_precision of an 8-bit image to 12
+static dt_imageio_retval_t _decompress_hp(dt_imageio_jpeg_t *jpg,
+                                          float *out,
+                                          const gboolean from_8_bit)
+{
+  struct dt_imageio_jpeg_error_mgr jerr;
+  jpg->dinfo.err = jpeg_std_error(&jerr.pub);
+  jerr.pub.error_exit = dt_imageio_jpeg_error_exit;
+  if(setjmp(jerr.setjmp_buffer))
+  {
+    jpeg_destroy_decompress(&(jpg->dinfo));
+    return DT_IMAGEIO_FILE_CORRUPTED;
+  }
+
+  _set_out_color_space_hp(&(jpg->dinfo));
+  (void)jpeg_start_decompress(&(jpg->dinfo));
+
+  const float white = from_8_bit ? DT_JPEG_8_TO_12_WHITE
+                                 : (float)((1 << jpg->dinfo.data_precision) - 1);
+  if(!_read_scanlines_hp(&(jpg->dinfo), out, white))
+  {
+    jpeg_destroy_decompress(&(jpg->dinfo));
+    return DT_IMAGEIO_FILE_CORRUPTED;
+  }
+
+  (void)jpeg_finish_decompress(&(jpg->dinfo));
+  jpeg_destroy_decompress(&(jpg->dinfo));
+  return DT_IMAGEIO_OK;
+}
 #endif
 
 
@@ -815,26 +847,12 @@ static void _set_image_properties(dt_image_t *img)
 
 #ifdef DT_JPEG_HAVE_HIGH_PRECISION
 // decodes an image with 9 to 16 bits per sample straight into the mipmap
-// buffer, closing the file. from_8_bit says that the caller raised
-// data_precision of an 8-bit image to 12
+// buffer, closing the file. see _decompress_hp() for from_8_bit
 static dt_imageio_retval_t _open_jpeg_hp(dt_image_t *img,
                                          dt_imageio_jpeg_t *jpg,
                                          dt_mipmap_buffer_t *mbuf,
                                          const gboolean from_8_bit)
 {
-  struct dt_imageio_jpeg_error_mgr jerr;
-  jpg->dinfo.err = jpeg_std_error(&jerr.pub);
-  jerr.pub.error_exit = dt_imageio_jpeg_error_exit;
-  if(setjmp(jerr.setjmp_buffer))
-  {
-    jpeg_destroy_decompress(&(jpg->dinfo));
-    fclose(jpg->f);
-    return DT_IMAGEIO_FILE_CORRUPTED;
-  }
-
-  _set_out_color_space_hp(&(jpg->dinfo));
-  (void)jpeg_start_decompress(&(jpg->dinfo));
-
   img->buf_dsc.channels = 4;
   img->buf_dsc.datatype = TYPE_FLOAT;
   float *buf = (float *)dt_mipmap_cache_alloc(mbuf, img);
@@ -845,19 +863,9 @@ static dt_imageio_retval_t _open_jpeg_hp(dt_image_t *img,
     return DT_IMAGEIO_CACHE_FULL;
   }
 
-  const float white = from_8_bit ? DT_JPEG_8_TO_12_WHITE
-                                 : (float)((1 << jpg->dinfo.data_precision) - 1);
-  if(!_read_scanlines_hp(&(jpg->dinfo), buf, white))
-  {
-    jpeg_destroy_decompress(&(jpg->dinfo));
-    fclose(jpg->f);
-    return DT_IMAGEIO_FILE_CORRUPTED;
-  }
-
-  (void)jpeg_finish_decompress(&(jpg->dinfo));
-  jpeg_destroy_decompress(&(jpg->dinfo));
+  const dt_imageio_retval_t ret = _decompress_hp(jpg, buf, from_8_bit);
   fclose(jpg->f);
-  return DT_IMAGEIO_OK;
+  return ret;
 }
 #endif
 
