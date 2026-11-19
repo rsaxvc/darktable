@@ -22,6 +22,12 @@
 
 #include <setjmp.h>
 
+// libjpeg-turbo 3.0 added the jpeg12_*() and jpeg16_*() entry points, which
+// decode 12-bit lossy and 9 to 16-bit lossless images
+#if defined(LIBJPEG_TURBO_VERSION_NUMBER) && LIBJPEG_TURBO_VERSION_NUMBER >= 3000000
+#define DT_JPEG_HAVE_HIGH_PRECISION
+#endif
+
 // error functions
 
 struct dt_imageio_jpeg_error_mgr
@@ -111,6 +117,50 @@ static void setup_read_exif(j_decompress_ptr cinfo)
   /* Tell the library to keep any APP1 data it may find */
   jpeg_save_markers(cinfo, EXIF_MARKER, 0xFFFF);
 }
+
+#ifdef DT_JPEG_HAVE_HIGH_PRECISION
+// libjpeg-turbo can't color convert lossless images, so a grayscale one
+// fails with an RGB output color space. decode it as grayscale and let
+// _read_scanlines_hp() expand it to RGB
+static void _set_out_color_space_hp(j_decompress_ptr dinfo)
+{
+  dinfo->out_color_space = dinfo->jpeg_color_space == JCS_GRAYSCALE ? JCS_GRAYSCALE : JCS_RGB;
+}
+
+// reads all scanlines of an image with 9 to 16 bits per sample, after
+// jpeg_start_decompress(), as RGBA into out
+static gboolean _read_scanlines_hp(j_decompress_ptr dinfo, float *out)
+{
+  const size_t width = dinfo->output_width;
+  const int nc = dinfo->output_components;
+  // gray is replicated into all three channels
+  const int step = nc == 1 ? 0 : 1;
+  const float scale = 1.0f / (float)((1 << dinfo->data_precision) - 1);
+
+  // from libjpeg's image pool, which jpeg_destroy_decompress() frees, so an
+  // error longjmp out of the decoder does not leak it
+  uint16_t *row = (*dinfo->mem->alloc_large)((j_common_ptr)dinfo, JPOOL_IMAGE,
+                                              sizeof(uint16_t) * nc * width);
+
+  while(dinfo->output_scanline < dinfo->output_height)
+  {
+    float *o = out + 4 * width * dinfo->output_scanline;
+    const JDIMENSION lines = dinfo->data_precision <= 12
+      ? jpeg12_read_scanlines(dinfo, (J12SAMPARRAY)&row, 1)
+      : jpeg16_read_scanlines(dinfo, (J16SAMPARRAY)&row, 1);
+    if(lines != 1)
+      return FALSE;
+
+    for(size_t i = 0; i < width; i++)
+    {
+      for(int k = 0; k < 3; k++)
+        o[4 * i + k] = row[nc * i + step * k] * scale;
+      o[4 * i + 3] = 1.0f;
+    }
+  }
+  return TRUE;
+}
+#endif
 
 
 int dt_imageio_jpeg_decompress_header(const void *in, size_t length, dt_imageio_jpeg_t *jpg)
@@ -743,6 +793,61 @@ dt_colorspaces_color_profile_type_t dt_imageio_jpeg_read_color_space(dt_imageio_
   return DT_COLORSPACE_DISPLAY; // nothing embedded
 }
 
+static void _set_image_properties(dt_image_t *img)
+{
+  img->buf_dsc.cst = IOP_CS_RGB; // JPEG is always RGB
+  img->buf_dsc.filters = 0u;
+  img->flags &= ~DT_IMAGE_RAW;
+  img->flags &= ~DT_IMAGE_S_RAW;
+  img->flags &= ~DT_IMAGE_HDR;
+  img->flags |= DT_IMAGE_LDR;
+  img->loader = LOADER_JPEG;
+}
+
+#ifdef DT_JPEG_HAVE_HIGH_PRECISION
+// decodes an image with 9 to 16 bits per sample straight into the mipmap
+// buffer, closing the file
+static dt_imageio_retval_t _open_jpeg_hp(dt_image_t *img,
+                                         dt_imageio_jpeg_t *jpg,
+                                         dt_mipmap_buffer_t *mbuf)
+{
+  struct dt_imageio_jpeg_error_mgr jerr;
+  jpg->dinfo.err = jpeg_std_error(&jerr.pub);
+  jerr.pub.error_exit = dt_imageio_jpeg_error_exit;
+  if(setjmp(jerr.setjmp_buffer))
+  {
+    jpeg_destroy_decompress(&(jpg->dinfo));
+    fclose(jpg->f);
+    return DT_IMAGEIO_FILE_CORRUPTED;
+  }
+
+  _set_out_color_space_hp(&(jpg->dinfo));
+  (void)jpeg_start_decompress(&(jpg->dinfo));
+
+  img->buf_dsc.channels = 4;
+  img->buf_dsc.datatype = TYPE_FLOAT;
+  float *buf = (float *)dt_mipmap_cache_alloc(mbuf, img);
+  if(!buf)
+  {
+    jpeg_destroy_decompress(&(jpg->dinfo));
+    fclose(jpg->f);
+    return DT_IMAGEIO_CACHE_FULL;
+  }
+
+  if(!_read_scanlines_hp(&(jpg->dinfo), buf))
+  {
+    jpeg_destroy_decompress(&(jpg->dinfo));
+    fclose(jpg->f);
+    return DT_IMAGEIO_FILE_CORRUPTED;
+  }
+
+  (void)jpeg_finish_decompress(&(jpg->dinfo));
+  jpeg_destroy_decompress(&(jpg->dinfo));
+  fclose(jpg->f);
+  return DT_IMAGEIO_OK;
+}
+#endif
+
 dt_imageio_retval_t dt_imageio_open_jpeg(dt_image_t *img,
                                          const char *filename,
                                          dt_mipmap_buffer_t *mbuf)
@@ -763,6 +868,19 @@ dt_imageio_retval_t dt_imageio_open_jpeg(dt_image_t *img,
 
   img->width = jpg.width;
   img->height = jpg.height;
+
+#ifdef DT_JPEG_HAVE_HIGH_PRECISION
+  if(jpg.dinfo.data_precision > 8)
+  {
+    dt_print(DT_DEBUG_IMAGEIO, "[jpeg_open] decoding '%s' with %d bits per sample",
+             filename, jpg.dinfo.data_precision);
+    const dt_imageio_retval_t ret = _open_jpeg_hp(img, &jpg, mbuf);
+    if(ret == DT_IMAGEIO_OK)
+      _set_image_properties(img);
+    return ret;
+  }
+#endif
+
   uint8_t *tmp = dt_alloc_align_uint8((size_t)4 * jpg.width * jpg.height);
   if(!tmp)
   {
@@ -798,13 +916,7 @@ dt_imageio_retval_t dt_imageio_open_jpeg(dt_image_t *img,
 
   dt_free_align(tmp);
 
-  img->buf_dsc.cst = IOP_CS_RGB; // JPEG is always RGB
-  img->buf_dsc.filters = 0u;
-  img->flags &= ~DT_IMAGE_RAW;
-  img->flags &= ~DT_IMAGE_S_RAW;
-  img->flags &= ~DT_IMAGE_HDR;
-  img->flags |= DT_IMAGE_LDR;
-  img->loader = LOADER_JPEG;
+  _set_image_properties(img);
 
   return DT_IMAGEIO_OK;
 }
