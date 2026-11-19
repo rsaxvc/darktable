@@ -28,6 +28,11 @@
 #define DT_JPEG_HAVE_HIGH_PRECISION
 #endif
 
+// libjpeg-turbo 3.1.90 added decoding an 8-bit image at 12 bits per sample
+#if defined(LIBJPEG_TURBO_VERSION_NUMBER) && LIBJPEG_TURBO_VERSION_NUMBER >= 3001090
+#define DT_JPEG_HAVE_8_TO_12
+#endif
+
 // error functions
 
 struct dt_imageio_jpeg_error_mgr
@@ -127,15 +132,19 @@ static void _set_out_color_space_hp(j_decompress_ptr dinfo)
   dinfo->out_color_space = dinfo->jpeg_color_space == JCS_GRAYSCALE ? JCS_GRAYSCALE : JCS_RGB;
 }
 
+// libjpeg-turbo decodes an 8-bit image at 12 bits by scaling its samples by
+// 16, so 8-bit white becomes 4080 rather than 4095. ringing can overshoot it
+#define DT_JPEG_8_TO_12_WHITE (255.0f * 16.0f)
+
 // reads all scanlines of an image with 9 to 16 bits per sample, after
-// jpeg_start_decompress(), as RGBA into out
-static gboolean _read_scanlines_hp(j_decompress_ptr dinfo, float *out)
+// jpeg_start_decompress(), as RGBA into out, with white at 1.0
+static gboolean _read_scanlines_hp(j_decompress_ptr dinfo, float *out, const float white)
 {
   const size_t width = dinfo->output_width;
   const int nc = dinfo->output_components;
   // gray is replicated into all three channels
   const int step = nc == 1 ? 0 : 1;
-  const float scale = 1.0f / (float)((1 << dinfo->data_precision) - 1);
+  const float scale = 1.0f / white;
 
   // from libjpeg's image pool, which jpeg_destroy_decompress() frees, so an
   // error longjmp out of the decoder does not leak it
@@ -806,10 +815,12 @@ static void _set_image_properties(dt_image_t *img)
 
 #ifdef DT_JPEG_HAVE_HIGH_PRECISION
 // decodes an image with 9 to 16 bits per sample straight into the mipmap
-// buffer, closing the file
+// buffer, closing the file. from_8_bit says that the caller raised
+// data_precision of an 8-bit image to 12
 static dt_imageio_retval_t _open_jpeg_hp(dt_image_t *img,
                                          dt_imageio_jpeg_t *jpg,
-                                         dt_mipmap_buffer_t *mbuf)
+                                         dt_mipmap_buffer_t *mbuf,
+                                         const gboolean from_8_bit)
 {
   struct dt_imageio_jpeg_error_mgr jerr;
   jpg->dinfo.err = jpeg_std_error(&jerr.pub);
@@ -834,7 +845,9 @@ static dt_imageio_retval_t _open_jpeg_hp(dt_image_t *img,
     return DT_IMAGEIO_CACHE_FULL;
   }
 
-  if(!_read_scanlines_hp(&(jpg->dinfo), buf))
+  const float white = from_8_bit ? DT_JPEG_8_TO_12_WHITE
+                                 : (float)((1 << jpg->dinfo.data_precision) - 1);
+  if(!_read_scanlines_hp(&(jpg->dinfo), buf, white))
   {
     jpeg_destroy_decompress(&(jpg->dinfo));
     fclose(jpg->f);
@@ -870,11 +883,22 @@ dt_imageio_retval_t dt_imageio_open_jpeg(dt_image_t *img,
   img->height = jpg.height;
 
 #ifdef DT_JPEG_HAVE_HIGH_PRECISION
+  gboolean from_8_bit = FALSE;
+#ifdef DT_JPEG_HAVE_8_TO_12
+  // the DCT coefficients of an 8-bit lossy JPEG hold more than 8 bits of
+  // precision. decoding at 12 bits keeps it, for smoother gradients and
+  // shadows that survive being pushed
+  if(jpg.dinfo.data_precision == 8)
+  {
+    jpg.dinfo.data_precision = 12;
+    from_8_bit = TRUE;
+  }
+#endif
   if(jpg.dinfo.data_precision > 8)
   {
-    dt_print(DT_DEBUG_IMAGEIO, "[jpeg_open] decoding '%s' with %d bits per sample",
-             filename, jpg.dinfo.data_precision);
-    const dt_imageio_retval_t ret = _open_jpeg_hp(img, &jpg, mbuf);
+    dt_print(DT_DEBUG_IMAGEIO, "[jpeg_open] decoding '%s' with %d bits per sample%s",
+             filename, jpg.dinfo.data_precision, from_8_bit ? ", from 8" : "");
+    const dt_imageio_retval_t ret = _open_jpeg_hp(img, &jpg, mbuf, from_8_bit);
     if(ret == DT_IMAGEIO_OK)
       _set_image_properties(img);
     return ret;
